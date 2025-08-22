@@ -1,0 +1,444 @@
+name: Yocto Build Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build target'
+        required: true
+        default: 'core-image-minimal'
+        type: choice
+        options:
+        - core-image-minimal
+        - core-image-base
+        - core-image-full-cmdline
+        - core-image-sato
+        - core-image-weston
+      machine:
+        description: 'Target machine'
+        required: true
+        default: 'qemux86-64'
+        type: choice
+        options:
+        - qemux86-64
+        - qemuarm64
+        - raspberrypi4-64
+        - raspberrypi4
+        - raspberrypi3-64
+        - raspberrypi3
+        - raspberrypi2
+        - raspberrypi
+        - raspberrypi0-wifi
+        - raspberrypi0
+      branch:
+        description: 'Yocto branch/version'
+        required: true
+        default: 'kirkstone'
+        type: choice
+        options:
+        - kirkstone
+        - dunfell
+        - hardknott
+        - honister
+        - langdale
+        - mickledore
+      clean_build:
+        description: 'Clean build (removes tmp directory)'
+        required: false
+        default: false
+        type: boolean
+      parallel_jobs:
+        description: 'Number of parallel jobs'
+        required: false
+        default: '4'
+        type: string
+
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'recipes-**'
+      - 'conf/**'
+      - 'meta-*/**'
+
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'recipes-**'
+      - 'conf/**'
+      - 'meta-*/**'
+
+env:
+  # Build configuration
+  YOCTO_BRANCH: ${{ github.event.inputs.branch || 'kirkstone' }}
+  MACHINE: ${{ github.event.inputs.machine || 'qemux86-64' }}
+  TARGET: ${{ github.event.inputs.target || 'core-image-minimal' }}
+  PARALLEL_JOBS: ${{ github.event.inputs.parallel_jobs || '4' }}
+  CLEAN_BUILD: ${{ github.event.inputs.clean_build || 'false' }}
+  
+  # Cache and workspace configuration
+  DL_DIR: /opt/yocto-cache/downloads
+  SSTATE_DIR: /opt/yocto-cache/sstate-cache
+  TMPDIR: /opt/yocto-cache/tmp
+  BUILDDIR: build
+  
+jobs:
+  # Build validation job for quick checks
+  validate:
+    runs-on: [self-hosted, yocto, linux, x64]
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        lfs: true
+
+    - name: Set up build environment
+      run: |
+        echo "Setting up Yocto build environment"
+        df -h
+        free -h
+        nproc
+        
+        # Ensure cache directories exist and are writable
+        sudo mkdir -p $DL_DIR $SSTATE_DIR $TMPDIR
+        sudo chown -R $USER:$USER /opt/yocto-cache
+        
+        # Set build variables
+        echo "MACHINE=$MACHINE" >> $GITHUB_ENV
+        echo "TARGET=$TARGET" >> $GITHUB_ENV
+        echo "DL_DIR=$DL_DIR" >> $GITHUB_ENV
+        echo "SSTATE_DIR=$SSTATE_DIR" >> $GITHUB_ENV
+        echo "TMPDIR=$TMPDIR" >> $GITHUB_ENV
+
+    - name: Initialize Yocto environment
+      run: |
+        # Clone or update poky
+        if [ ! -d "poky" ]; then
+          git clone -b $YOCTO_BRANCH https://git.yoctoproject.org/git/poky
+        else
+          cd poky && git fetch && git checkout $YOCTO_BRANCH && git pull && cd ..
+        fi
+        
+        # Clone meta-openembedded if needed
+        if [ ! -d "meta-openembedded" ]; then
+          git clone -b $YOCTO_BRANCH https://git.openembedded.org/meta-openembedded
+        else
+          cd meta-openembedded && git fetch && git checkout $YOCTO_BRANCH && git pull && cd ..
+        fi
+        
+        # Clone meta-raspberrypi for Raspberry Pi builds
+        if [[ "$MACHINE" == raspberrypi* ]] && [ ! -d "meta-raspberrypi" ]; then
+          git clone -b $YOCTO_BRANCH https://git.yoctoproject.org/git/meta-raspberrypi
+        fi
+
+    - name: Configure build
+      run: |
+        source poky/oe-init-build-env $BUILDDIR
+        
+        # Configure local.conf
+        cat >> conf/local.conf << EOF
+        
+        # Machine configuration
+        MACHINE = "$MACHINE"
+        
+        # Performance tuning
+        BB_NUMBER_THREADS = "$PARALLEL_JOBS"
+        PARALLEL_MAKE = "-j $PARALLEL_JOBS"
+        
+        # Cache configuration
+        DL_DIR = "$DL_DIR"
+        SSTATE_DIR = "$SSTATE_DIR"
+        TMPDIR = "$TMPDIR"
+        
+        # Disk space monitoring
+        BB_DISKMON_DIRS = "STOPTASKS,\${TMPDIR},1G,100K STOPTASKS,\${DL_DIR},1G,100K STOPTASKS,\${SSTATE_DIR},1G,100K ABORT,\${TMPDIR},100M,1K ABORT,\${DL_DIR},100M,1K ABORT,\${SSTATE_DIR},100M,1K"
+        
+        # Package management
+        PACKAGE_CLASSES ?= "package_rpm"
+        EXTRA_IMAGE_FEATURES ?= "debug-tweaks"
+        
+        # Security and compliance
+        INHERIT += "buildhistory"
+        BUILDHISTORY_COMMIT = "1"
+        
+        EOF
+        
+        # Add meta-layers to bblayers.conf if they exist
+        if [ -d "../meta-openembedded" ]; then
+          bitbake-layers add-layer ../meta-openembedded/meta-oe
+          bitbake-layers add-layer ../meta-openembedded/meta-python
+          bitbake-layers add-layer ../meta-openembedded/meta-networking
+        fi
+        
+        if [ -d "../meta-raspberrypi" ] && [[ "$MACHINE" == raspberrypi* ]]; then
+          bitbake-layers add-layer ../meta-raspberrypi
+        fi
+        
+        # Show configuration
+        echo "Build configuration:"
+        echo "MACHINE: $MACHINE"
+        echo "TARGET: $TARGET"
+        echo "PARALLEL_JOBS: $PARALLEL_JOBS"
+        bitbake-layers show-layers
+
+    - name: Syntax check and recipe validation
+      run: |
+        source poky/oe-init-build-env $BUILDDIR
+        
+        echo "Validating recipes and configuration..."
+        
+        # Parse recipes
+        bitbake -p
+        
+        # Show target recipe info
+        bitbake -e $TARGET | grep "^IMAGE_"
+        
+        # Validate custom recipes if they exist
+        if ls ../recipes-* 1> /dev/null 2>&1; then
+          echo "Found custom recipes, validating..."
+          for recipe_dir in ../recipes-*; do
+            if [ -d "$recipe_dir" ]; then
+              echo "Checking $recipe_dir"
+              # Add validation logic here
+            fi
+          done
+        fi
+
+    - name: Build dependencies only
+      if: github.event_name == 'pull_request'
+      run: |
+        source poky/oe-init-build-env $BUILDDIR
+        
+        echo "Building dependencies for validation..."
+        bitbake -c fetchall $TARGET
+        bitbake -c populate_sdk $TARGET --dry-run
+
+  # Full build job
+  build:
+    runs-on: [self-hosted, yocto, linux, x64]
+    needs: [validate]
+    if: always() && (needs.validate.result == 'success' || github.event_name != 'pull_request')
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - machine: qemux86-64
+            target: core-image-minimal
+          - machine: raspberrypi4-64
+            target: core-image-base
+            
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        lfs: true
+
+    - name: Clean previous build
+      if: env.CLEAN_BUILD == 'true'
+      run: |
+        echo "Cleaning previous build artifacts..."
+        sudo rm -rf $TMPDIR/* || true
+        df -h
+
+    - name: Set up build environment
+      run: |
+        echo "=== System Information ==="
+        uname -a
+        df -h
+        free -h
+        nproc
+        echo "=========================="
+        
+        # Ensure cache directories exist
+        sudo mkdir -p $DL_DIR $SSTATE_DIR $TMPDIR
+        sudo chown -R $USER:$USER /opt/yocto-cache
+        
+        # Set matrix-specific environment
+        echo "MACHINE=${{ matrix.machine }}" >> $GITHUB_ENV
+        echo "TARGET=${{ matrix.target }}" >> $GITHUB_ENV
+
+    - name: Initialize Yocto environment
+      run: |
+        echo "Initializing Yocto $YOCTO_BRANCH environment..."
+        
+        # Clone poky
+        if [ ! -d "poky" ]; then
+          git clone -b $YOCTO_BRANCH https://git.yoctoproject.org/git/poky
+        fi
+        
+        # Clone meta-openembedded
+        if [ ! -d "meta-openembedded" ]; then
+          git clone -b $YOCTO_BRANCH https://git.openembedded.org/meta-openembedded
+        fi
+        
+        # Clone meta-raspberrypi for RPi builds
+        if [[ "${{ matrix.machine }}" == raspberrypi* ]] && [ ! -d "meta-raspberrypi" ]; then
+          git clone -b $YOCTO_BRANCH https://git.yoctoproject.org/git/meta-raspberrypi
+        fi
+
+    - name: Configure build environment
+      run: |
+        source poky/oe-init-build-env $BUILDDIR
+        
+        cat > conf/local.conf << EOF
+        MACHINE = "${{ matrix.machine }}"
+        
+        # Performance configuration
+        BB_NUMBER_THREADS = "$PARALLEL_JOBS"
+        PARALLEL_MAKE = "-j $PARALLEL_JOBS"
+        
+        # Cache and workspace
+        DL_DIR = "$DL_DIR"
+        SSTATE_DIR = "$SSTATE_DIR" 
+        TMPDIR = "$TMPDIR"
+        
+        # Disk monitoring
+        BB_DISKMON_DIRS = "STOPTASKS,\${TMPDIR},2G,100M STOPTASKS,\${DL_DIR},1G,100M STOPTASKS,\${SSTATE_DIR},1G,100M ABORT,\${TMPDIR},500M,1M ABORT,\${DL_DIR},100M,1M ABORT,\${SSTATE_DIR},100M,1M"
+        
+        # Package and image configuration
+        PACKAGE_CLASSES ?= "package_rpm"
+        EXTRA_IMAGE_FEATURES ?= "debug-tweaks package-management"
+        
+        # Build history and reproducibility
+        INHERIT += "buildhistory"
+        BUILDHISTORY_COMMIT = "1"
+        SOURCE_DATE_EPOCH = "1640995200"
+        
+        # Security features
+        DISTRO_FEATURES:append = " systemd"
+        VIRTUAL-RUNTIME_init_manager = "systemd"
+        
+        EOF
+        
+        # Add required layers
+        bitbake-layers add-layer ../meta-openembedded/meta-oe
+        bitbake-layers add-layer ../meta-openembedded/meta-python
+        bitbake-layers add-layer ../meta-openembedded/meta-networking
+        
+        if [[ "${{ matrix.machine }}" == raspberrypi* ]]; then
+          bitbake-layers add-layer ../meta-raspberrypi
+        fi
+        
+        echo "Configuration complete:"
+        bitbake-layers show-layers
+
+    - name: Build Yocto image
+      timeout-minutes: 480  # 8 hours max
+      run: |
+        source poky/oe-init-build-env $BUILDDIR
+        
+        echo "Starting build of ${{ matrix.target }} for ${{ matrix.machine }}"
+        echo "Build started at: $(date)"
+        
+        # Monitor system resources during build
+        (
+          while true; do
+            echo "$(date): CPU: $(uptime | awk '{print $10,$11,$12}') | Memory: $(free -h | grep Mem | awk '{print $3"/"$2}') | Disk: $(df -h /opt/yocto-cache | tail -1 | awk '{print $3"/"$2" ("$5")"}')"
+            sleep 300  # Every 5 minutes
+          done
+        ) &
+        MONITOR_PID=$!
+        
+        # Run the build
+        bitbake ${{ matrix.target }} 2>&1 | tee build-${{ matrix.machine }}-${{ matrix.target }}.log
+        BUILD_RESULT=${PIPESTATUS[0]}
+        
+        # Stop monitoring
+        kill $MONITOR_PID 2>/dev/null || true
+        
+        echo "Build completed at: $(date)"
+        echo "Build result: $BUILD_RESULT"
+        
+        if [ $BUILD_RESULT -eq 0 ]; then
+          echo "Build SUCCESS"
+          
+          # Show build results
+          ls -la tmp/deploy/images/${{ matrix.machine }}/
+          
+          # Calculate image sizes
+          find tmp/deploy/images/${{ matrix.machine }}/ -name "*.wic*" -o -name "*.img*" -o -name "*.rootfs.*" | while read file; do
+            echo "$(basename "$file"): $(du -h "$file" | cut -f1)"
+          done
+          
+        else
+          echo "Build FAILED"
+          
+          # Show recent error logs
+          echo "Recent build errors:"
+          find tmp/log -name "log.do_*" -mtime -1 -exec grep -l "ERROR\|FAILED" {} \; | head -5 | while read log; do
+            echo "=== $log ==="
+            tail -20 "$log"
+            echo "============="
+          done
+          
+          exit $BUILD_RESULT
+        fi
+
+    - name: Generate build report
+      if: always()
+      run: |
+        source poky/oe-init-build-env $BUILDDIR
+        
+        echo "=== Build Report ===" > build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        echo "Machine: ${{ matrix.machine }}" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        echo "Target: ${{ matrix.target }}" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        echo "Branch: $YOCTO_BRANCH" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        echo "Build Date: $(date)" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        echo "Build Host: $(uname -a)" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        echo "Parallel Jobs: $PARALLEL_JOBS" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        echo "" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        
+        if [ -d "tmp/deploy/images/${{ matrix.machine }}" ]; then
+          echo "=== Build Artifacts ===" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+          ls -la tmp/deploy/images/${{ matrix.machine }}/ >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+          echo "" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+          
+          echo "=== Package Statistics ===" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+          if [ -d "tmp/deploy/rpm" ]; then
+            find tmp/deploy/rpm -name "*.rpm" | wc -l | xargs echo "Total RPM packages:" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+          fi
+        fi
+        
+        echo "=== System Resources at End ===" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        df -h >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        echo "" >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        free -h >> build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+
+    - name: Archive build artifacts
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: yocto-build-${{ matrix.machine }}-${{ matrix.target }}-${{ github.run_number }}
+        path: |
+          ${{ env.BUILDDIR }}/tmp/deploy/images/${{ matrix.machine }}/
+          build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        retention-days: 7
+
+    - name: Upload build logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-${{ matrix.machine }}-${{ matrix.target }}-${{ github.run_number }}
+        path: |
+          build-${{ matrix.machine }}-${{ matrix.target }}.log
+          ${{ env.BUILDDIR }}/tmp/log/
+          build-report-${{ matrix.machine }}-${{ matrix.target }}.txt
+        retention-days: 3
+
+    - name: Clean up workspace
+      if: always()
+      run: |
+        echo "Cleaning up build workspace..."
+        # Keep downloads and sstate cache, but clean tmp
+        if [ "$CLEAN_BUILD" = "true" ] || [ "${{ github.event_name }}" = "pull_request" ]; then
+          sudo rm -rf $TMPDIR/* || true
+        fi
+        
+        # Clean old build directories
+        find . -maxdepth 1 -name "build*" -type d -mtime +1 -exec rm -rf {} \; || true
+        
+        df -h
